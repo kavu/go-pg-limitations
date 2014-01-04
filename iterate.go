@@ -2,61 +2,95 @@ package main
 
 import (
 	"database/sql"
-	"fmt"
 	_ "github.com/lib/pq"
 	"log"
+	"runtime"
+	"sync"
 )
 
-func main() {
-	db, err := sql.Open("postgres", "dbname=golang_pg_limitations user=kir sslmode=disable")
+const postgresConnectionInfo = "dbname=test user=test password=test sslmode=disable"
+
+var (
+	db, innerDB                     *sql.DB
+	screenNameQuery, selectAllQuery *sql.Stmt
+	wg                              sync.WaitGroup
+)
+
+func queryScreenName(accountId int, screenName string) {
+	var dupAccountId int
+
+	log.Printf("Account#%d: %s\n", accountId, screenName)
+
+	dup_rows, err := screenNameQuery.Query(screenName)
 	if err != nil {
+		log.Fatalln(err)
+	}
+
+	for dup_rows.Next() {
+		if err := dup_rows.Scan(&dupAccountId); err != nil {
+			log.Fatalln(err)
+		}
+
+		log.Printf("Duplicate: %d\n", dupAccountId)
+	}
+
+	if err := dup_rows.Err(); err != nil {
 		log.Fatal(err)
 	}
 
-	// db.SetMaxIdleConns(80)
-	// db.SetMaxOpenConns(80)
+	wg.Done()
+}
 
-	query := "SELECT id, screen_name FROM accounts"
-	rows, err := db.Query(query)
+func init() {
+	var err error
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	if db, err = sql.Open("postgres", postgresConnectionInfo); err != nil {
+		log.Fatalln(err)
+	}
+	db.SetMaxOpenConns(5)
+
+	if selectAllQuery, err = db.Prepare("SELECT id, screen_name FROM accounts"); err != nil {
+		log.Fatalln(err)
+	}
+
+	if innerDB, err = sql.Open("postgres", postgresConnectionInfo); err != nil {
+		log.Fatalln(err)
+	}
+	innerDB.SetMaxOpenConns(5)
+
+	if screenNameQuery, err = innerDB.Prepare("SELECT id FROM accounts WHERE screen_name = $1"); err != nil {
+		log.Fatalln(err)
+	}
+}
+
+func main() {
+	var (
+		account_id  int
+		screen_name string
+	)
+
+	defer db.Close()
+	defer innerDB.Close()
+
+	rows, err := selectAllQuery.Query()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 
 	for rows.Next() {
-		var (
-			account_id  int
-			screen_name string
-		)
-
-		err := rows.Scan(&account_id, &screen_name)
-		if err != nil {
-			log.Fatal(err)
+		if err := rows.Scan(&account_id, &screen_name); err != nil {
+			log.Fatalln(err)
 		}
 
-		fmt.Printf("Account#%d: %s\n", account_id, screen_name)
-
-		dup_query := "SELECT id FROM accounts WHERE screen_name = $1"
-		dup_rows, err := db.Query(dup_query, screen_name)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		for dup_rows.Next() {
-			var (
-				dup_account_id int
-			)
-
-			err := dup_rows.Scan(&dup_account_id)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			fmt.Printf("Duplicate: %d\n", dup_account_id)
-		}
+		wg.Add(1)
+		go queryScreenName(account_id, screen_name)
 	}
 
 	if err := rows.Err(); err != nil {
-		log.Fatal(err)
+		log.Fatalln(err)
 	}
 
+	wg.Wait()
 }
